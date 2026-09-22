@@ -1,0 +1,6 @@
+{
+  "time": 1790099073.3892767,
+  "gpus": 8,
+  "result": "PASS: shard contents exact before/during/after offload; next FSDP forward bitwise equal",
+  "scope": "inference-only mixed-precision FSDP four-layer model; full StoryMem validation remains required"
+}

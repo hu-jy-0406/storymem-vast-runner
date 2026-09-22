@@ -1,0 +1,15 @@
+{
+  "time": 1790097467.508602,
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "sequence_length": 32760,
+  "shards": 8,
+  "weights": "official T2V low-noise time embedding/projection",
+  "max_absolute_errors": [
+    5.4836273193359375e-06,
+    1.3113021850585938e-05
+  ],
+  "original_peak_allocated_bytes": 6108119040,
+  "sharded_peak_allocated_bytes": 1411645440,
+  "source_modified": false,
+  "scope": "single GPU evaluates all 8 row shards; does not prove full pipeline stability"
+}

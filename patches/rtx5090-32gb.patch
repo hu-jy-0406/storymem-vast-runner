@@ -1,0 +1,198 @@
+diff --git a/pipeline.py b/pipeline.py
+index 903aa9f..9362148 100644
+--- a/pipeline.py
++++ b/pipeline.py
+@@ -17,6 +17,7 @@ from wan.distributed.util import init_distributed_group
+ from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
+ from wan.utils.utils import save_video, str2bool
+ from extract_keyframes import save_keyframes
++from wan.distributed.fsdp import offload_idle_fsdp_shards
+ 
+ 
+ def _parse_args():
+@@ -170,7 +171,10 @@ def main(args):
+                 normalize=True,
+                 value_range=(-1, 1)
+             )
+-            save_keyframes(f"{args.output_dir}/01_01.mp4")
++            with offload_idle_fsdp_shards(t2v_model.low_noise_model,
++                                         t2v_model.high_noise_model,
++                                         t2v_model.text_encoder.model):
++                save_keyframes(f"{args.output_dir}/01_01.mp4")
+             del video
+             torch.cuda.empty_cache()
+ 
+@@ -285,7 +289,10 @@ def main(args):
+                     normalize=True,
+                     value_range=(-1, 1)
+                 )
+-                save_keyframes(f"{args.output_dir}/{scene_num:02d}_{shot_num:02d}.mp4")
++                with offload_idle_fsdp_shards(m2v_model.low_noise_model,
++                                             m2v_model.high_noise_model,
++                                             m2v_model.text_encoder.model):
++                    save_keyframes(f"{args.output_dir}/{scene_num:02d}_{shot_num:02d}.mp4")
+                 del video
+                 torch.cuda.empty_cache()
+ 
+diff --git a/wan/distributed/fsdp.py b/wan/distributed/fsdp.py
+index 3577a33..df16bf4 100644
+--- a/wan/distributed/fsdp.py
++++ b/wan/distributed/fsdp.py
+@@ -1,6 +1,7 @@
+ # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+ import gc
+ from functools import partial
++from contextlib import contextmanager
+ 
+ import torch
+ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+@@ -41,3 +42,38 @@ def free_model(model):
+     del model
+     gc.collect()
+     torch.cuda.empty_cache()
++
++
++@contextmanager
++def offload_idle_fsdp_shards(*models):
++    """Temporarily move idle FSDP shard references while an auxiliary model runs.
++
++    Module.cpu() moves flat_param.data, but FSDP keeps its own _local_shard
++    reference. Restore its exact dtype/content/device before the next forward.
++    Only already-offloaded, inference-only modules may enter this context.
++    """
++    moved = []
++    seen = set()
++    try:
++        for model in models:
++            for module in model.modules():
++                if not isinstance(module, FSDP) or module._handle is None:
++                    continue
++                flat = module._handle.flat_param
++                if id(flat) in seen:
++                    continue
++                seen.add(id(flat))
++                shard = getattr(flat, "_local_shard", None)
++                if shard is not None and shard.is_cuda and not flat.is_cuda:
++                    assert not flat.requires_grad, "Only inference shards may be offloaded"
++                    device = shard.device
++                    flat._local_shard = shard.cpu()
++                    moved.append((flat, device))
++                del shard
++        torch.cuda.empty_cache()
++        yield
++    finally:
++        gc.collect()
++        torch.cuda.empty_cache()
++        for flat, device in moved:
++            flat._local_shard = flat._local_shard.to(device)
+diff --git a/wan/distributed/sequence_parallel.py b/wan/distributed/sequence_parallel.py
+index 2579463..d9795bb 100644
+--- a/wan/distributed/sequence_parallel.py
++++ b/wan/distributed/sequence_parallel.py
+@@ -99,12 +99,15 @@ def sp_dit_forward(
+     # time embeddings
+     if t.dim() == 1:
+         t = t.expand(t.size(0), seq_len)
++    # Project only the local sequence shard; each row is independent.
++    t = torch.chunk(t, get_world_size(), dim=1)[get_rank()]
++    local_seq_len = t.size(1)
+     with torch.amp.autocast('cuda', dtype=torch.float32):
+         bt = t.size(0)
+         t = t.flatten()
+         e = self.time_embedding(
+             sinusoidal_embedding_1d(self.freq_dim,
+-                                    t).unflatten(0, (bt, seq_len)).float())
++                                    t).unflatten(0, (bt, local_seq_len)).float())
+         e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+         assert e.dtype == torch.float32 and e0.dtype == torch.float32
+ 
+@@ -118,8 +121,6 @@ def sp_dit_forward(
+ 
+     # Context Parallel
+     x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
+-    e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
+-    e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
+ 
+     # arguments
+     kwargs = dict(
+diff --git a/wan/distributed/sequence_parallel_memory.py b/wan/distributed/sequence_parallel_memory.py
+index a6da5b1..a148328 100644
+--- a/wan/distributed/sequence_parallel_memory.py
++++ b/wan/distributed/sequence_parallel_memory.py
+@@ -100,13 +100,16 @@ def sp_dit_forward(
+ 
+     if t.dim() == 1:
+         t = t.expand(t.size(0), seq_len)
++    # Project only the local sequence shard; each row is independent.
++    t = torch.chunk(t, get_world_size(), dim=1)[get_rank()]
++    local_seq_len = t.size(1)
+ 
+     with torch.amp.autocast("cuda", dtype=torch.float32):
+         bt = t.size(0)
+         t_flat = t.flatten()
+         
+         emb = sinusoidal_embedding_1d(t_flat, self.freq_dim)
+-        e = self.time_embedding(emb.unflatten(0, (bt, seq_len)).float())
++        e = self.time_embedding(emb.unflatten(0, (bt, local_seq_len)).float())
+         e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+         assert e.dtype == torch.float32 and e0.dtype == torch.float32
+ 
+@@ -124,8 +127,6 @@ def sp_dit_forward(
+     assert x.size(1) % world == 0, f"seq_len={x.size(1)} not divisible by world_size={world}"
+ 
+     x  = torch.chunk(x,  world, dim=1)[rank]
+-    e  = torch.chunk(e,  world, dim=1)[rank]
+-    e0 = torch.chunk(e0, world, dim=1)[rank]
+     # freqs = torch.chunk(self.freqs, world, dim=0)[rank] # freqs: [seq_len, freq_dim]
+ 
+     kwargs = dict(
+diff --git a/wan/memory2video.py b/wan/memory2video.py
+index 9bcfb27..85967ac 100644
+--- a/wan/memory2video.py
++++ b/wan/memory2video.py
+@@ -19,7 +19,7 @@ import torchvision.transforms.functional as TF
+ from peft import LoraConfig, PeftModel, get_peft_model, set_peft_model_state_dict
+ from tqdm import tqdm
+ 
+-from .distributed.fsdp import shard_model
++from .distributed.fsdp import shard_model, offload_idle_fsdp_shards
+ from .distributed.sequence_parallel_memory import sp_attn_forward, sp_dit_forward
+ from .distributed.util import get_world_size
+ from .modules.model_memory import WanModel_Memory
+@@ -551,7 +551,10 @@ class WanM2V:
+                 torch.cuda.empty_cache()
+ 
+             if self.rank == 0:
+-                video, memory = self._vae_decode(x0, with_memory=True, memory_size=memory_size)
++                with offload_idle_fsdp_shards(self.low_noise_model,
++                                             self.high_noise_model,
++                                             self.text_encoder.model):
++                    video, memory = self._vae_decode(x0, with_memory=True, memory_size=memory_size)
+ 
+         del noise, latent
+         del sample_scheduler
+diff --git a/wan/text2video.py b/wan/text2video.py
+index d71b05a..9a76c88 100644
+--- a/wan/text2video.py
++++ b/wan/text2video.py
+@@ -14,7 +14,7 @@ import torch.cuda.amp as amp
+ import torch.distributed as dist
+ from tqdm import tqdm
+ 
+-from .distributed.fsdp import shard_model
++from .distributed.fsdp import shard_model, offload_idle_fsdp_shards
+ from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
+ from .distributed.util import get_world_size
+ from .modules.model import WanModel
+@@ -366,7 +366,10 @@ class WanT2V:
+                 self.high_noise_model.cpu()
+                 torch.cuda.empty_cache()
+             if self.rank == 0:
+-                video = self.vae.decode(x0).float().clamp_(-1, 1).squeeze(0)
++                with offload_idle_fsdp_shards(self.low_noise_model,
++                                             self.high_noise_model,
++                                             self.text_encoder.model):
++                    video = self.vae.decode(x0).float().clamp_(-1, 1).squeeze(0)
+ 
+         del noise, latents
+         del sample_scheduler

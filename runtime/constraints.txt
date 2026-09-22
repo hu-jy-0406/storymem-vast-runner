@@ -1,0 +1,4 @@
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+transformers==4.45.2
+trl==0.11.4
