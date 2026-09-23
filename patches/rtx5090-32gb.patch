@@ -147,7 +147,7 @@ index a6da5b1..a148328 100644
  
      kwargs = dict(
 diff --git a/wan/memory2video.py b/wan/memory2video.py
-index 9bcfb27..85967ac 100644
+index 9bcfb27..6c511b9 100644
 --- a/wan/memory2video.py
 +++ b/wan/memory2video.py
 @@ -19,7 +19,7 @@ import torchvision.transforms.functional as TF
@@ -159,7 +159,30 @@ index 9bcfb27..85967ac 100644
  from .distributed.sequence_parallel_memory import sp_attn_forward, sp_dit_forward
  from .distributed.util import get_world_size
  from .modules.model_memory import WanModel_Memory
-@@ -551,7 +551,10 @@ class WanM2V:
+@@ -432,7 +432,12 @@ class WanM2V:
+ 
+         memory = [torch.nn.functional.interpolate(img[None].cpu(), size=(h, w), mode='bicubic') for img in memory]
+         memory = torch.cat(memory, dim=0).to(self.device)
+-        memory = self.vae.encode(memory.unsqueeze(2)).float().squeeze(2).permute(1, 0, 2, 3) # M, C, 1, H, W -> C, M, H, W
++        memory = self.vae.encode(memory.unsqueeze(2)).float().squeeze(2).permute(1, 0, 2, 3) # M, C, 1, H, W -> C, M, H, W
++        # Keep the encoded memory on CPU while encoding the next conditioning input.
++        # The VAE encoder needs a large temporary workspace; retaining memory on
++        # the GPU here can exhaust 32 GB RTX 5090 cards during later shots.
++        memory = memory.cpu()
++        torch.cuda.empty_cache()
+         if first_frame_file is not None:
+             u = self.vae.encode(
+                 torch.concat([
+@@ -450,7 +455,7 @@ class WanM2V:
+         else:
+             u = torch.zeros(3, F, h, w).to(self.device)
+             u = self.vae.encode(u.unsqueeze(0)).float().squeeze(0)
+-        y = torch.cat([memory, u], dim=1)
++        y = torch.cat([memory.to(self.device), u], dim=1)
+         y = torch.cat([msk, y], dim=0)
+ 
+         @contextmanager
+@@ -551,7 +556,10 @@ class WanM2V:
                  torch.cuda.empty_cache()
  
              if self.rank == 0:
